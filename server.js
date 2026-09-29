@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
@@ -11,6 +12,79 @@ app.use(express.static('public'));
 const PORT = process.env.PORT || 3000;
 const rooms = new Map();
 const SESSION_TTL = 24 * 60 * 60 * 1000;
+
+// Optional PostgreSQL persistence.
+// When DATABASE_URL is configured (recommended on Render), rooms survive
+// web-service restarts/spin-downs. Without it, the game still works in memory.
+const db = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized:false }
+}) : null;
+
+async function initDb(){
+  if(!db) return;
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS room_state (
+      code TEXT PRIMARY KEY,
+      state JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+function serializeRoom(r){
+  return {
+    code:r.code, phase:r.phase, gameId:r.gameId, roundNo:r.roundNo,
+    pair:r.pair, undercoverId:r.undercoverId,
+    aliveIds:[...r.aliveIds], votes:[...r.votes],
+    result:r.result, nextReady:[...r.nextReady], newReady:[...r.newReady],
+    createdAt:r.createdAt,
+    players:[...r.players.values()].map(p=>({
+      id:p.id, token:p.token, name:p.name, ready:!!p.ready,
+      inGame:!!p.inGame, lastSeen:p.lastSeen||Date.now()
+    }))
+  };
+}
+
+function deserializeRoom(x){
+  const r={
+    code:x.code, phase:x.phase||'lobby', players:new Map(), gameId:x.gameId||null,
+    roundNo:x.roundNo||0, pair:x.pair||null, undercoverId:x.undercoverId||null,
+    aliveIds:new Set(x.aliveIds||[]), votes:new Map(x.votes||[]), result:x.result||null,
+    nextReady:new Set(x.nextReady||[]), newReady:new Set(x.newReady||[]),
+    createdAt:x.createdAt||Date.now()
+  };
+  for(const p of x.players||[]) r.players.set(p.id,{
+    ...p, connected:false, socketId:null
+  });
+  return r;
+}
+
+async function persistRoom(r){
+  if(!db || !r) return;
+  try{
+    await db.query(
+      `INSERT INTO room_state(code,state,updated_at)
+       VALUES($1,$2::jsonb,NOW())
+       ON CONFLICT(code) DO UPDATE SET state=EXCLUDED.state, updated_at=NOW()`,
+      [r.code, JSON.stringify(serializeRoom(r))]
+    );
+  }catch(e){ console.error('persistRoom',e.message); }
+}
+
+async function loadRoom(roomCode){
+  if(!db) return null;
+  try{
+    const q=await db.query('SELECT state FROM room_state WHERE code=$1',[roomCode]);
+    return q.rows[0]?.state ? deserializeRoom(q.rows[0].state) : null;
+  }catch(e){ console.error('loadRoom',e.message); return null; }
+}
+
+async function deletePersistedRoom(roomCode){
+  if(!db) return;
+  try{ await db.query('DELETE FROM room_state WHERE code=$1',[roomCode]); }
+  catch(e){ console.error('deletePersistedRoom',e.message); }
+}
 
 const PAIRS = [
   ['咖啡','咖啡','kāfēi','coffee','珍珠奶茶','珍珠奶茶','zhēnzhū nǎichá','bubble tea'],
@@ -55,10 +129,14 @@ function code(v){ return String(v||'').trim().toUpperCase(); }
 function cleanName(v){ return String(v||'').trim().replace(/\s+/g,' ').slice(0,20); }
 function roomOf(socket){ return socket.data.roomCode ? rooms.get(socket.data.roomCode) : null; }
 function playerOf(socket){ const r=roomOf(socket); return r?.players.get(socket.data.playerId) || null; }
-function getRoom(roomCode){
+async function getRoom(roomCode){
   const c=code(roomCode);
-  if(!rooms.has(c)) rooms.set(c,{ code:c, phase:'lobby', players:new Map(), gameId:null, roundNo:0, pair:null, undercoverId:null, aliveIds:new Set(), votes:new Map(), result:null, nextReady:new Set(), newReady:new Set(), createdAt:Date.now() });
-  return rooms.get(c);
+  if(rooms.has(c)) return rooms.get(c);
+  const saved=await loadRoom(c);
+  if(saved){ rooms.set(c,saved); return saved; }
+  const fresh={ code:c, phase:'lobby', players:new Map(), gameId:null, roundNo:0, pair:null, undercoverId:null, aliveIds:new Set(), votes:new Map(), result:null, nextReady:new Set(), newReady:new Set(), createdAt:Date.now() };
+  rooms.set(c,fresh);
+  return fresh;
 }
 function activePlayers(r){ return [...r.players.values()].filter(p=>p.connected); }
 function inGamePlayers(r){ return [...r.players.values()].filter(p=>p.inGame); }
@@ -109,11 +187,11 @@ function checkQuitWin(r){
 }
 
 io.on('connection', socket => {
-  socket.on('joinRoom',(data={},ack=()=>{})=>{
+  socket.on('joinRoom',async (data={},ack=()=>{})=>{
     const roomCode=code(data.roomCode), name=cleanName(data.name), incomingToken=String(data.token||'');
     if(!/^[A-Z2-9]{6}$/.test(roomCode)) return ack({ok:false,error:'Invalid room code',errorZh:'房間碼格式錯誤。'});
     if(!name) return ack({ok:false,error:'Name is required',errorZh:'請輸入名字。'});
-    const r=getRoom(roomCode);
+    const r=await getRoom(roomCode);
     let p=null;
     if(incomingToken) p=[...r.players.values()].find(x=>x.token===incomingToken) || null;
     if(!p) p=[...r.players.values()].find(x=>x.name.toLocaleLowerCase()===name.toLocaleLowerCase() && !x.connected) || null;
@@ -138,28 +216,31 @@ io.on('connection', socket => {
     }
 
     socket.data.roomCode=roomCode; socket.data.playerId=p.id; socket.join(roomCode);
+    await persistRoom(r);
     ack({ok:true,roomCode,token:p.token,snapshot:snapshot(r,p.id)});
     sync(r);
     if(isNewPlayer && r.gameId && r.phase==='roundResult' && !r.result?.winner){
       notice(r,`${p.name} 已加入，會從下一輪以平民身份參賽。`,`${p.name} joined and will enter the next round as a civilian.`,'ok');
     }
   });
-  socket.on('setReady',({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='lobby')return;p.ready=!!ready;sync(r);checkStart(r);});
-  socket.on('openVote',()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='game'||!r.aliveIds.has(p.id))return;r.phase='vote';r.votes.clear();sync(r);});
-  socket.on('vote',({targetId}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='vote'||!r.aliveIds.has(p.id)||r.votes.has(p.id)||!r.aliveIds.has(targetId)||targetId===p.id)return;r.votes.set(p.id,targetId);sync(r);resolveVote(r);});
-  socket.on('nextReady',({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='roundResult'||!r.aliveIds.has(p.id))return;ready?r.nextReady.add(p.id):r.nextReady.delete(p.id);sync(r);maybeNextRound(r);});
-  socket.on('newReady',({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='final')return;ready?r.newReady.add(p.id):r.newReady.delete(p.id);sync(r);maybeNewGame(r);});
+  socket.on('setReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='lobby')return;p.ready=!!ready;sync(r);checkStart(r);await persistRoom(r);});
+  socket.on('openVote',async ()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='game'||!r.aliveIds.has(p.id))return;r.phase='vote';r.votes.clear();sync(r);await persistRoom(r);});
+  socket.on('vote',async ({targetId}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='vote'||!r.aliveIds.has(p.id)||r.votes.has(p.id)||!r.aliveIds.has(targetId)||targetId===p.id)return;r.votes.set(p.id,targetId);sync(r);resolveVote(r);await persistRoom(r);});
+  socket.on('nextReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='roundResult'||!r.aliveIds.has(p.id))return;ready?r.nextReady.add(p.id):r.nextReady.delete(p.id);sync(r);maybeNextRound(r);await persistRoom(r);});
+  socket.on('newReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='final')return;ready?r.newReady.add(p.id):r.newReady.delete(p.id);sync(r);maybeNewGame(r);await persistRoom(r);});
   socket.on('requestSnapshot',()=>{const r=roomOf(socket),p=playerOf(socket);if(r&&p)socket.emit('snapshot',snapshot(r,p.id));});
-  socket.on('leaveRoom',(_,ack=()=>{})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return ack({ok:true});if(r.aliveIds.has(p.id))r.aliveIds.delete(p.id);r.players.delete(p.id);r.votes.delete(p.id);r.nextReady.delete(p.id);r.newReady.delete(p.id);socket.leave(r.code);socket.data.roomCode=null;socket.data.playerId=null;checkQuitWin(r);sync(r);ack({ok:true});});
-  socket.on('disconnect',()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return;p.connected=false;p.socketId=null;p.lastSeen=Date.now();sync(r);notice(r,`${p.name} 暫時離線；伺服器不會自動淘汰或代替投票。`,`${p.name} is temporarily offline. The server will not auto-eliminate them or cast a vote for them.`,'warn');});
+  socket.on('leaveRoom',async (_,ack=()=>{})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return ack({ok:true});if(r.aliveIds.has(p.id))r.aliveIds.delete(p.id);r.players.delete(p.id);r.votes.delete(p.id);r.nextReady.delete(p.id);r.newReady.delete(p.id);socket.leave(r.code);socket.data.roomCode=null;socket.data.playerId=null;checkQuitWin(r);sync(r);await persistRoom(r);ack({ok:true});});
+  socket.on('disconnect',async ()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return;p.connected=false;p.socketId=null;p.lastSeen=Date.now();sync(r);await persistRoom(r);notice(r,`${p.name} 暫時離線；伺服器不會自動淘汰或代替投票。`,`${p.name} is temporarily offline. The server will not auto-eliminate them or cast a vote for them.`,'warn');});
 });
 
 setInterval(()=>{
   const now=Date.now();
   for(const [roomCode,r] of rooms){
     for(const [id,p] of r.players){ if(!p.connected && now-p.lastSeen>SESSION_TTL && !r.aliveIds.has(id)) r.players.delete(id); }
-    if(r.players.size===0 && now-r.createdAt>SESSION_TTL) rooms.delete(roomCode);
+    if(r.players.size===0 && now-r.createdAt>SESSION_TTL){ rooms.delete(roomCode); deletePersistedRoom(roomCode); }
   }
 },60*60*1000).unref();
 
-server.listen(PORT,()=>console.log(`Undercover server running on http://localhost:${PORT}`));
+initDb()
+  .then(()=>server.listen(PORT,()=>console.log(`Undercover server running on http://localhost:${PORT}`)))
+  .catch(err=>{ console.error('Database init failed:',err); process.exit(1); });
