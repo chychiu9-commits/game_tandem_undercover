@@ -150,7 +150,8 @@ function snapshot(r,viewerId){
   const myWord = r.gameId && me?.inGame ? (viewerId===r.undercoverId?r.pair?.undercover:r.pair?.civilian) : null;
   let result=r.result ? {...r.result} : null;
   if(result && r.phase==='final') result={...result,pair:r.pair,undercoverName:r.players.get(r.undercoverId)?.name||''};
-  return { roomCode:r.code,selfId:viewerId,phase,players:[...r.players.values()].map(p=>publicPlayer(r,p,viewerId)),aliveIds:[...r.aliveIds],myWord,gameId:r.gameId,roundNo:r.roundNo,result,votesCast:[...r.votes.keys()],nextReady:[...r.nextReady],newReady:[...r.newReady] };
+  const aliveCount=counts(r);
+  return { roomCode:r.code,selfId:viewerId,phase,players:[...r.players.values()].map(p=>publicPlayer(r,p,viewerId)),aliveIds:[...r.aliveIds],myWord,gameId:r.gameId,roundNo:r.roundNo,result,votesCast:[...r.votes.keys()],nextReady:[...r.nextReady],newReady:[...r.newReady],aliveCounts:aliveCount };
 }
 function sync(r){ for(const p of r.players.values()) if(p.connected && p.socketId) io.to(p.socketId).emit('snapshot',snapshot(r,p.id)); }
 function notice(r,zh,en,type='warn'){ io.to(r.code).emit('notice',{zh,en,type}); }
