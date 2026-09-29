@@ -166,8 +166,19 @@ function startGame(r){
 function checkStart(r){ if(r.phase==='lobby' && !r.gameId) startGame(r); }
 function resolveVote(r){
   if(r.phase!=='vote') return;
-  const alive=[...r.aliveIds]; if(alive.length<2 || alive.some(id=>!r.votes.has(id))) return;
-  const tally=new Map(); for(const [voter,target] of r.votes){ if(r.aliveIds.has(voter)&&r.aliveIds.has(target)) tally.set(target,(tally.get(target)||0)+1); }
+
+  // Only connected, alive players are required to submit a vote.
+  // Offline players remain alive and keep their role/word, but they do not
+  // block the entire room from finishing the current round.
+  const requiredVoters=[...r.aliveIds].filter(id=>r.players.get(id)?.connected);
+  if(requiredVoters.length<1 || requiredVoters.some(id=>!r.votes.has(id))) return;
+
+  const tally=new Map();
+  for(const [voter,target] of r.votes){
+    if(requiredVoters.includes(voter) && r.aliveIds.has(target)){
+      tally.set(target,(tally.get(target)||0)+1);
+    }
+  }
   const max=Math.max(0,...tally.values()); const top=[...tally.entries()].filter(([,n])=>n===max).map(([id])=>id);
   const res={gameId:r.gameId,roundNo:r.roundNo,aliveIds:[...r.aliveIds],winner:null,tie:false,eliminatedId:null,eliminatedWasSpy:false,civiliansAlive:0,spiesAlive:0};
   if(top.length!==1){ res.tie=true; }
@@ -271,6 +282,11 @@ io.on('connection', socket => {
     p.socketId=null;
     p.lastSeen=Date.now();
     sync(r);
+
+    // If the room is voting, a disconnected player must not freeze the round.
+    // Re-check whether all currently connected alive players have already voted.
+    if(r.phase==='vote') resolveVote(r);
+
     await persistRoom(r);
     notice(r,`${p.name} 暫時離線；伺服器不會自動淘汰或代替投票。`,`${p.name} is temporarily offline. The server will not auto-eliminate them or cast a vote for them.`,'warn');
   });
