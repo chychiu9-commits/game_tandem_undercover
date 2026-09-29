@@ -151,7 +151,7 @@
 (() => {
   const $ = id => document.getElementById(id);
   const socket = io({ autoConnect: true, reconnection: true, reconnectionAttempts: Infinity });
-  const state = { roomCode:'', name:'', token:'', selfId:'', phase:'login', players:[], aliveIds:[], myWord:null, gameId:null, roundNo:0, result:null, votesCast:[], nextReady:[], newReady:[], aliveCounts:{civ:0,spy:0} };
+  const state = { roomCode:'', name:'', token:'', selfId:'', phase:'login', players:[], aliveIds:[], myWord:null, gameId:null, roundNo:0, result:null, votesCast:[], nextReady:[], newReady:[], aliveCounts:{civ:0,spy:0}, lobbyReadyCount:0, lobbyOnlineCount:0 };
   const SESSION_KEY = 'undercoverServerSessionV1';
   const LANG_KEY = 'undercoverLangs';
 
@@ -193,16 +193,16 @@
     const list=$('playerList'); list.innerHTML='';
     for(const p of state.players){
       const row=document.createElement('div'); row.className='player';
-      row.innerHTML=`<div class="player-main"><div class="player-name">${esc(p.name)}${p.id===state.selfId?' <span style="color:#7a6f66">（你 / You）</span>':''}</div></div><span class="badge ${p.ready?'ready':'waiting'}">${p.ready?'準備 / Ready':p.connected?'等待 / Waiting':'離線 / Offline'}</span>`;
+      row.innerHTML=`<div class="player-main"><div class="player-name">${esc(p.name)}${p.id===state.selfId?' <span style="color:#7a6f66">（你 / You）</span>':''}</div></div><span class="badge ${!p.connected?'out':p.ready?'ready':'waiting'}">${!p.connected?'離線 / Offline':p.ready?'準備 / Ready':'等待 / Waiting'}</span>`;
       list.appendChild(row);
     }
     const me=myPlayer();
     $('readyBtn').classList.toggle('ready',!!me?.ready);
     $('readyBtn').innerHTML=me?.ready?'<span class="hant">取消準備</span><span class="hans">取消准备</span><span class="py">Qǔxiāo zhǔnbèi</span><span class="en">Cancel Ready</span>':'<span class="hant">我準備好了</span><span class="hans">我准备好了</span><span class="py">Wǒ zhǔnbèi hǎo le</span><span class="en">I\'m Ready</span>';
-    const connected=state.players.filter(p=>p.connected);
-    if(connected.length<3) status($('lobbyStatus'),'至少需要 3 位在線玩家。','至少需要 3 位在线玩家。','Zhìshǎo xūyào sān wèi zàixiàn wánjiā.','At least 3 online players are required.','warn');
-    else if(connected.some(p=>!p.ready)) status($('lobbyStatus'),'等待所有在線玩家按準備。','等待所有在线玩家按准备。','Děngdài suǒyǒu zàixiàn wánjiā àn zhǔnbèi.','Waiting for all online players to press Ready.','warn');
-    else status($('lobbyStatus'),'所有人已準備，伺服器正在開始遊戲。','所有人已准备，服务器正在开始游戏。','Suǒyǒu rén yǐ zhǔnbèi.','Everyone is ready. The server is starting the game…','busy');
+    const online=state.lobbyOnlineCount||0, readyCount=state.lobbyReadyCount||0;
+    if(online<3) status($('lobbyStatus'),`目前在線 ${online} 人，已準備 ${readyCount} 人；至少需要 3 位在線玩家。`,`目前在线 ${online} 人，已准备 ${readyCount} 人；至少需要 3 位在线玩家。`,`Mùqián zàixiàn ${online} rén, yǐ zhǔnbèi ${readyCount} rén.`,`${readyCount}/${online} online players are ready. At least 3 online players are required.`,'warn');
+    else if(readyCount<online) status($('lobbyStatus'),`目前在線 ${online} 人，已準備 ${readyCount} 人。等待其餘玩家準備。`,`目前在线 ${online} 人，已准备 ${readyCount} 人。等待其余玩家准备。`,`Mùqián zàixiàn ${online} rén, yǐ zhǔnbèi ${readyCount} rén.`,`${readyCount}/${online} online players are ready. Waiting for the others.`,'warn');
+    else status($('lobbyStatus'),`目前在線 ${online} 人，${readyCount} 人全部準備完成，伺服器正在開始遊戲。`,`目前在线 ${online} 人，${readyCount} 人全部准备完成，服务器正在开始游戏。`,`Suǒyǒu zàixiàn wánjiā yǐ zhǔnbèi.`,`All ${readyCount}/${online} online players are ready. Starting the game…`,'busy');
   }
 
   function showGame(){
@@ -310,7 +310,7 @@
   function applySnapshot(s){
     state.roomCode=s.roomCode; state.selfId=s.selfId; state.phase=s.phase; state.players=s.players||[];
     state.aliveIds=s.aliveIds||[]; state.myWord=s.myWord||null; state.gameId=s.gameId||null; state.roundNo=s.roundNo||0;
-    state.result=s.result||null; state.votesCast=s.votesCast||[]; state.nextReady=s.nextReady||[]; state.newReady=s.newReady||[]; state.aliveCounts=s.aliveCounts||{civ:0,spy:0};
+    state.result=s.result||null; state.votesCast=s.votesCast||[]; state.nextReady=s.nextReady||[]; state.newReady=s.newReady||[]; state.aliveCounts=s.aliveCounts||{civ:0,spy:0}; state.lobbyReadyCount=s.lobbyReadyCount||0; state.lobbyOnlineCount=s.lobbyOnlineCount||0;
     saveSession();
     if(s.phase==='lobby') renderLobby();
     else if(s.phase==='game') showGame();
@@ -344,7 +344,16 @@
   $('createBtn').onclick=()=>{const n=$('nameInput').value.trim();if(!n)return status($('loginStatus'),'請先輸入名字。','请先输入名字。','Qǐng xiān shūrù míngzi.','Please enter your name first.','error');const c=makeCode();$('roomInput').value=c;enterRoom(c,n)};
   $('joinBtn').onclick=()=>{const n=$('nameInput').value.trim(),c=$('roomInput').value.trim().toUpperCase();if(!n)return status($('loginStatus'),'請先輸入名字。','请先输入名字。','Qǐng xiān shūrù míngzi.','Please enter your name first.','error');if(!/^[A-Z2-9]{6}$/.test(c))return status($('loginStatus'),'請輸入 6 位房間碼。','请输入 6 位房间码。','Qǐng shūrù liù wèi fángjiān mǎ.','Please enter a 6-character room code.','error');enterRoom(c,n)};
   $('rejoinBtn').onclick=()=>{const s=loadSession();if(!s)return; $('nameInput').value=s.name;$('roomInput').value=s.roomCode;enterRoom(s.roomCode,s.name,s.token)};
-  $('readyBtn').onclick=()=>socket.emit('setReady',{ready:!myPlayer()?.ready});
+  $('readyBtn').onclick=async ()=>{
+    const btn=$('readyBtn');
+    const me=myPlayer();
+    if(!me) return status($('lobbyStatus'),'找不到你的玩家資料，請重新加入房間。','找不到你的玩家资料，请重新加入房间。','Zhǎo bù dào wánjiā zīliào.','Your player data could not be found. Please rejoin the room.','error');
+    if(!socket.connected) return status($('lobbyStatus'),'目前與伺服器斷線，請等待重新連線後再按準備。','目前与服务器断线，请等待重新连接后再按准备。','Fúwùqì liánxiàn zhōngduàn.','You are disconnected from the server. Wait for reconnection before pressing Ready.','error');
+    btn.disabled=true;
+    const r=await emitAck('setReady',{ready:!me.ready});
+    btn.disabled=false;
+    if(!r.ok) status($('lobbyStatus'),r.errorZh||'準備失敗。',r.errorZh||'准备失败。','Zhǔnbèi shībài.',r.error||'Failed to change ready state.','error');
+  };
   $('goVoteBtn').onclick=()=>socket.emit('openVote');
   $('submitVoteBtn').onclick=()=>{const r=document.querySelector('input[name=vote]:checked');if(!r)return;const n=playerName(r.value);if(!confirm(`第一次確認：你要投給 ${n} 嗎？\nFirst confirmation: vote for ${n}?`))return;if(!confirm(`第二次最終確認：確定送出給 ${n}？送出後不能更改。\nFinal confirmation: submit your vote for ${n}? This cannot be changed.`))return;socket.emit('vote',{targetId:r.value});};
   $('continueBtn').onclick=()=>socket.emit('nextReady',{ready:!state.nextReady.includes(state.selfId)});
