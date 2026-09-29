@@ -139,7 +139,7 @@ async function getRoom(roomCode){
   rooms.set(c,fresh);
   return fresh;
 }
-function activePlayers(r){ return [...r.players.values()].filter(p=>p.connected); }
+function activePlayers(r){ return [...r.players.values()].filter(p=>p.connected && p.socketId && io.sockets.sockets.has(p.socketId)); }
 function inGamePlayers(r){ return [...r.players.values()].filter(p=>p.inGame); }
 function counts(r){ let spy=0,civ=0; for(const id of r.aliveIds){ id===r.undercoverId?spy++:civ++; } return {spy,civ}; }
 function publicPlayer(r,p,viewerId){ return { id:p.id,name:p.name,ready:p.ready,connected:p.connected,inGame:!!p.inGame,isUndercover:(r.phase==='final' ? p.id===r.undercoverId : undefined) }; }
@@ -151,7 +151,9 @@ function snapshot(r,viewerId){
   let result=r.result ? {...r.result} : null;
   if(result && r.phase==='final') result={...result,pair:r.pair,undercoverName:r.players.get(r.undercoverId)?.name||''};
   const aliveCount=counts(r);
-  return { roomCode:r.code,selfId:viewerId,phase,players:[...r.players.values()].map(p=>publicPlayer(r,p,viewerId)),aliveIds:[...r.aliveIds],myWord,gameId:r.gameId,roundNo:r.roundNo,result,votesCast:[...r.votes.keys()],nextReady:[...r.nextReady],newReady:[...r.newReady],aliveCounts:aliveCount };
+  const online=activePlayers(r);
+  const lobbyReadyCount=online.filter(p=>p.ready).length;
+  return { roomCode:r.code,selfId:viewerId,phase,players:[...r.players.values()].map(p=>publicPlayer(r,p,viewerId)),aliveIds:[...r.aliveIds],myWord,gameId:r.gameId,roundNo:r.roundNo,result,votesCast:[...r.votes.keys()],nextReady:[...r.nextReady],newReady:[...r.newReady],aliveCounts:aliveCount,lobbyReadyCount,lobbyOnlineCount:online.length };
 }
 function sync(r){ for(const p of r.players.values()) if(p.connected && p.socketId) io.to(p.socketId).emit('snapshot',snapshot(r,p.id)); }
 function notice(r,zh,en,type='warn'){ io.to(r.code).emit('notice',{zh,en,type}); }
@@ -242,6 +244,7 @@ io.on('connection', socket => {
       }
     }
     p.name=name; p.connected=true; p.socketId=socket.id; p.lastSeen=Date.now();
+    if(r.phase==='lobby') p.ready=false;
 
     // 每輪結束（roundResult）到下一輪開始前，允許新玩家直接加入下一輪。
     // 為了不在同一局中途改變臥底身份，新加入者固定以平民身份加入，並使用同一組平民詞。
@@ -266,7 +269,17 @@ io.on('connection', socket => {
       notice(r,`${p.name} 已加入，會從下一輪以平民身份參賽。`,`${p.name} joined and will enter the next round as a civilian.`,'ok');
     }
   });
-  socket.on('setReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='lobby')return;p.ready=!!ready;sync(r);checkStart(r);await persistRoom(r);});
+  socket.on('setReady',async ({ready}={},ack=()=>{})=>{
+    const r=roomOf(socket),p=playerOf(socket);
+    if(!r||!p) return ack({ok:false,errorZh:'找不到房間或玩家身分。',error:'Room or player identity not found.'});
+    if(r.phase!=='lobby') return ack({ok:false,errorZh:'目前不在遊戲大廳，不能切換準備狀態。',error:'Ready state can only be changed in the lobby.'});
+    if(p.socketId!==socket.id || !p.connected) return ack({ok:false,errorZh:'此裝置不是目前有效的玩家連線，請重新加入房間。',error:'This device is not the active player connection. Please rejoin the room.'});
+    p.ready=!!ready;
+    sync(r);
+    checkStart(r);
+    await persistRoom(r);
+    ack({ok:true,ready:p.ready});
+  });
   socket.on('openVote',async ()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='game'||!r.aliveIds.has(p.id))return;r.phase='vote';r.votes.clear();sync(r);await persistRoom(r);});
   socket.on('vote',async ({targetId}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='vote'||!r.aliveIds.has(p.id)||r.votes.has(p.id)||!r.aliveIds.has(targetId)||targetId===p.id)return;r.votes.set(p.id,targetId);sync(r);resolveVote(r);await persistRoom(r);});
   socket.on('nextReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='roundResult'||!r.aliveIds.has(p.id))return;ready?r.nextReady.add(p.id):r.nextReady.delete(p.id);sync(r);maybeNextRound(r);await persistRoom(r);});
@@ -282,6 +295,7 @@ io.on('connection', socket => {
     p.connected=false;
     p.socketId=null;
     p.lastSeen=Date.now();
+    if(r.phase==='lobby') p.ready=false;
     sync(r);
 
     // If the room is voting, a disconnected player must not freeze the round.
