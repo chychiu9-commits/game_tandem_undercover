@@ -127,6 +127,7 @@ function pickPair(){
 function token(){ return crypto.randomBytes(18).toString('base64url'); }
 function code(v){ return String(v||'').trim().toUpperCase(); }
 function cleanName(v){ return String(v||'').trim().replace(/\s+/g,' ').slice(0,20); }
+function nameKey(v){ return cleanName(v).toLocaleLowerCase(); }
 function roomOf(socket){ return socket.data.roomCode ? rooms.get(socket.data.roomCode) : null; }
 function playerOf(socket){ const r=roomOf(socket); return r?.players.get(socket.data.playerId) || null; }
 async function getRoom(roomCode){
@@ -192,12 +193,42 @@ io.on('connection', socket => {
     if(!/^[A-Z2-9]{6}$/.test(roomCode)) return ack({ok:false,error:'Invalid room code',errorZh:'房間碼格式錯誤。'});
     if(!name) return ack({ok:false,error:'Name is required',errorZh:'請輸入名字。'});
     const r=await getRoom(roomCode);
-    let p=null;
-    if(incomingToken) p=[...r.players.values()].find(x=>x.token===incomingToken) || null;
-    if(!p) p=[...r.players.values()].find(x=>x.name.toLocaleLowerCase()===name.toLocaleLowerCase() && !x.connected) || null;
-    if(!p && [...r.players.values()].some(x=>x.name.toLocaleLowerCase()===name.toLocaleLowerCase() && x.connected)) return ack({ok:false,error:'That name is already in use',errorZh:'這個名字目前已有人使用。'});
+    // Identity rule: room code + normalized player name uniquely identifies a player.
+    // This intentionally works even without a browser token, so switching phones/browsers
+    // restores the same playerId, role, word, alive/eliminated state and vote state.
+    let p=[...r.players.values()].find(x=>nameKey(x.name)===nameKey(name)) || null;
+
+    // Token is only a secondary compatibility path and may never rename a different player.
+    if(!p && incomingToken){
+      const byToken=[...r.players.values()].find(x=>x.token===incomingToken) || null;
+      if(byToken && nameKey(byToken.name)===nameKey(name)) p=byToken;
+    }
+
     const isNewPlayer=!p;
-    if(!p){ p={id:crypto.randomUUID(),token:token(),name,ready:false,connected:true,socketId:socket.id,lastSeen:Date.now(),inGame:false}; r.players.set(p.id,p); }
+    if(!p){
+      p={id:crypto.randomUUID(),token:token(),name,ready:false,connected:true,socketId:socket.id,lastSeen:Date.now(),inGame:false};
+      r.players.set(p.id,p);
+    } else {
+      // A login from another phone/browser takes over this same identity.
+      // Set the new socket first so the stale socket's disconnect event cannot
+      // mark the newly connected player offline.
+      const oldSocketId=p.socketId;
+      p.name=name;
+      p.connected=true;
+      p.socketId=socket.id;
+      p.lastSeen=Date.now();
+
+      if(oldSocketId && oldSocketId!==socket.id){
+        const oldSocket=io.sockets.sockets.get(oldSocketId);
+        if(oldSocket){
+          oldSocket.emit('identityTakenOver',{
+            zh:'此玩家身分已在另一個裝置登入。',
+            en:'This player identity was signed in on another device.'
+          });
+          oldSocket.disconnect(true);
+        }
+      }
+    }
     p.name=name; p.connected=true; p.socketId=socket.id; p.lastSeen=Date.now();
 
     // 每輪結束（roundResult）到下一輪開始前，允許新玩家直接加入下一輪。
@@ -230,13 +261,29 @@ io.on('connection', socket => {
   socket.on('newReady',async ({ready}={})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p||r.phase!=='final')return;ready?r.newReady.add(p.id):r.newReady.delete(p.id);sync(r);maybeNewGame(r);await persistRoom(r);});
   socket.on('requestSnapshot',()=>{const r=roomOf(socket),p=playerOf(socket);if(r&&p)socket.emit('snapshot',snapshot(r,p.id));});
   socket.on('leaveRoom',async (_,ack=()=>{})=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return ack({ok:true});if(r.aliveIds.has(p.id))r.aliveIds.delete(p.id);r.players.delete(p.id);r.votes.delete(p.id);r.nextReady.delete(p.id);r.newReady.delete(p.id);socket.leave(r.code);socket.data.roomCode=null;socket.data.playerId=null;checkQuitWin(r);sync(r);await persistRoom(r);ack({ok:true});});
-  socket.on('disconnect',async ()=>{const r=roomOf(socket),p=playerOf(socket);if(!r||!p)return;p.connected=false;p.socketId=null;p.lastSeen=Date.now();sync(r);await persistRoom(r);notice(r,`${p.name} 暫時離線；伺服器不會自動淘汰或代替投票。`,`${p.name} is temporarily offline. The server will not auto-eliminate them or cast a vote for them.`,'warn');});
+  socket.on('disconnect',async ()=>{
+    const r=roomOf(socket),p=playerOf(socket);
+    if(!r||!p)return;
+    // Ignore a stale device disconnecting after the same room+name was taken over
+    // by a newer phone/browser connection.
+    if(p.socketId!==socket.id) return;
+    p.connected=false;
+    p.socketId=null;
+    p.lastSeen=Date.now();
+    sync(r);
+    await persistRoom(r);
+    notice(r,`${p.name} 暫時離線；伺服器不會自動淘汰或代替投票。`,`${p.name} is temporarily offline. The server will not auto-eliminate them or cast a vote for them.`,'warn');
+  });
 });
 
 setInterval(()=>{
   const now=Date.now();
   for(const [roomCode,r] of rooms){
-    for(const [id,p] of r.players){ if(!p.connected && now-p.lastSeen>SESSION_TTL && !r.aliveIds.has(id)) r.players.delete(id); }
+    for(const [id,p] of r.players){
+      // Never expire a player identity while a game still exists. This guarantees
+      // room+name can restore the same role/word even after a long disconnect.
+      if(!r.gameId && !p.connected && now-p.lastSeen>SESSION_TTL && !r.aliveIds.has(id)) r.players.delete(id);
+    }
     if(r.players.size===0 && now-r.createdAt>SESSION_TTL){ rooms.delete(roomCode); deletePersistedRoom(roomCode); }
   }
 },60*60*1000).unref();
