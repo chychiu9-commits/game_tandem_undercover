@@ -151,7 +151,7 @@
 (() => {
   const $ = id => document.getElementById(id);
   const socket = io({ autoConnect: true, reconnection: true, reconnectionAttempts: Infinity });
-  const state = { roomCode:'', name:'', token:'', selfId:'', phase:'login', players:[], aliveIds:[], myWord:null, gameId:null, roundNo:0, result:null, votesCast:[], nextReady:[], newReady:[] };
+  const state = { roomCode:'', name:'', token:'', selfId:'', phase:'login', players:[], aliveIds:[], myWord:null, gameId:null, roundNo:0, result:null, votesCast:[], nextReady:[], newReady:[], aliveCounts:{civ:0,spy:0} };
   const SESSION_KEY = 'undercoverServerSessionV1';
   const LANG_KEY = 'undercoverLangs';
 
@@ -213,8 +213,8 @@
     $('wordMain').textContent=onlyHans?(state.myWord?.simp||state.myWord?.trad||'••••'):(state.myWord?.trad||state.myWord?.simp||'••••');
     $('wordPinyin').textContent=state.myWord?.pinyin||'';
     $('wordEnglish').textContent=state.myWord?.en||'';
-    const c=state.aliveIds.filter(id=>!state.players.find(p=>p.id===id)?.isUndercover).length;
-    status($('gameStatus'),`第 ${state.roundNo} 輪。描述完成後，任何仍在場玩家都可以開啟投票。`,`第 ${state.roundNo} 轮。描述完成后，任何仍在场玩家都可以开启投票。`,`Dì ${state.roundNo} lún.`,`Round ${state.roundNo}. Any active player may open voting after discussion.`,'ok');
+    const c=state.aliveCounts||{civ:0,spy:0};
+    status($('gameStatus'),`第 ${state.roundNo} 輪：目前場上 ${c.civ} 位平民、${c.spy} 位臥底。描述完成後，任何仍在場玩家都可以開啟投票。`,`第 ${state.roundNo} 轮：目前场上 ${c.civ} 位平民、${c.spy} 位卧底。描述完成后，任何仍在场玩家都可以开启投票。`,`Dì ${state.roundNo} lún: mùqián chǎngshàng ${c.civ} wèi píngmín, ${c.spy} wèi wòdǐ.`,`Round ${state.roundNo}: ${c.civ} civilian(s) and ${c.spy} undercover player(s) remain. Any active player may open voting after discussion.`,'ok');
   }
 
   function showSpectator(){
@@ -310,7 +310,7 @@
   function applySnapshot(s){
     state.roomCode=s.roomCode; state.selfId=s.selfId; state.phase=s.phase; state.players=s.players||[];
     state.aliveIds=s.aliveIds||[]; state.myWord=s.myWord||null; state.gameId=s.gameId||null; state.roundNo=s.roundNo||0;
-    state.result=s.result||null; state.votesCast=s.votesCast||[]; state.nextReady=s.nextReady||[]; state.newReady=s.newReady||[];
+    state.result=s.result||null; state.votesCast=s.votesCast||[]; state.nextReady=s.nextReady||[]; state.newReady=s.newReady||[]; state.aliveCounts=s.aliveCounts||{civ:0,spy:0};
     saveSession();
     if(s.phase==='lobby') renderLobby();
     else if(s.phase==='game') showGame();
